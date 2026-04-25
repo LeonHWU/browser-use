@@ -7,6 +7,7 @@ This service provides a clean interface for agents to interact with Gmail.
 import base64
 import logging
 import os
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,10 @@ class GmailService:
 	"""
 
 	# Gmail API scopes
-	SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+	SCOPES = [
+		'https://www.googleapis.com/auth/gmail.readonly',
+		'https://www.googleapis.com/auth/gmail.send',
+	]
 
 	def __init__(
 		self,
@@ -61,7 +65,8 @@ class GmailService:
 
 		# Set up credential paths
 		self.credentials_file = credentials_file or self.config_dir / 'gmail_credentials.json'
-		self.token_file = token_file or self.config_dir / 'gmail_token.json'
+		env_token_file = os.getenv('GMAIL_OAUTH_TOKEN_PATH', '').strip()
+		self.token_file = token_file or env_token_file or self.config_dir / 'gmail_token.json'
 
 		# Direct access token support
 		self.access_token = access_token
@@ -105,6 +110,7 @@ class GmailService:
 				if self.creds and self.creds.expired and self.creds.refresh_token:
 					logger.info('🔄 Refreshing expired tokens...')
 					self.creds.refresh(Request())
+					await anyio.Path(self.token_file).write_text(self.creds.to_json())
 				else:
 					logger.info('🌐 Starting OAuth flow...')
 					if not os.path.exists(self.credentials_file):
@@ -188,6 +194,45 @@ class GmailService:
 		except Exception as e:
 			logger.error(f'❌ Unexpected error fetching emails: {e}')
 			return []
+
+	async def send_email(self, to: str, subject: str, body: str, cc: str = '', bcc: str = '') -> dict[str, Any]:
+		"""
+		Send a plain text email through the authenticated Gmail account.
+		Args:
+		    to: Recipient email address. For multiple recipients, use comma-separated addresses.
+		    subject: Email subject.
+		    body: Plain text email body.
+		    cc: Optional comma-separated CC recipients.
+		    bcc: Optional comma-separated BCC recipients.
+		Returns:
+		    Gmail API send response containing id/threadId/labelIds.
+		"""
+		if not self.is_authenticated():
+			logger.error('❌ Gmail service not authenticated. Call authenticate() first.')
+			return {}
+
+		try:
+			message = EmailMessage()
+			message['To'] = to
+			if cc.strip():
+				message['Cc'] = cc
+			if bcc.strip():
+				message['Bcc'] = bcc
+			message['Subject'] = subject
+			message.set_content(body)
+
+			raw = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+
+			assert self.service is not None
+			result = self.service.users().messages().send(userId='me', body={'raw': raw}).execute()
+			logger.info(f'📧 Sent Gmail message: {result.get("id", "")}')
+			return result
+		except HttpError as error:
+			logger.error(f'❌ Gmail send API error: {error}')
+			return {'error': str(error)}
+		except Exception as e:
+			logger.error(f'❌ Unexpected error sending email: {e}')
+			return {'error': str(e)}
 
 	def _parse_email(self, message: dict[str, Any]) -> dict[str, Any]:
 		"""Parse Gmail message into readable format"""
